@@ -1,12 +1,18 @@
 #!/bin/bash
 
-# export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=7
 
-llmc=/path/to/llmc
+llmc=/mnt/disk1/lct/llmc
 export PYTHONPATH=$llmc:$PYTHONPATH
 
-task_name=awq_w_only
-config=${llmc}/configs/quantization/methods/Awq/awq_w_only.yml
+task_name=fastv_llava—log
+config=${llmc}/configs/sparsification/methods/FastV/fastv.yml
+
+# task_name=tome_llava
+# config=${llmc}/configs/sparsification/methods/ToMe/tome.yml
+
+# task_name=sparsevlm_llava
+# config=${llmc}/configs/sparsification/methods/SparseVLM/sparsevlm.yml
 
 nnodes=1
 nproc_per_node=1

@@ -15,9 +15,7 @@ eval:
 sparse:
     method: TokenReduction
     special:
-        method: FastV
-        pruning_loc: 3
-        rate: 0.5
+        method: SparseVLM
 save:
     save_trans: False
     save_fake: False
