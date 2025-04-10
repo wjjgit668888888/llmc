@@ -386,6 +386,214 @@ class SparseVLM(TokenReductionModule):
         # If no stored mask or mask not in inputs, do nothing (return None means no change)
         return None
 
+    def register_attention_hooks(self):
+        """
+        仿照 register_reduction_modules 方式注册三个 hook：
+        1. 对 self.self_attn.q_proj 注册 store_q_proj_hook；
+        2. 对 self.self_attn.k_proj 注册 store_k_proj_hook；
+        3. 对 self.self_attn 注册 attn_logits_hook，在 forward 结束后增加 attn_logits 返回值。
+        """
+        # 注册 q_proj 的 forward hook
+        self.self_attn.q_proj.register_forward_hook(store_q_proj_hook)
+        # 注册 k_proj 的 forward hook
+        self.self_attn.k_proj.register_forward_hook(store_k_proj_hook)
+        # 注册 self_attn 的 forward hook
+        self.self_attn.register_forward_hook(attn_logits_hook)
+    
+    def store_q_proj_hook(module, inputs, output):
+        """
+        对 q_proj 输出注册 Hook，用于保存 query_states：
+        输出 shape: [B, L, hidden_dim]
+        转换为： [B, num_heads, L, head_dim]
+        """
+        # 假定 module 所在的父模块具有 num_heads 与 head_dim 属性
+        parent = module.__self__  # 注意：这种方法依赖于 q_proj 是模块的属性，具体可能需要调整
+        B, L, _ = output.size()
+        # 这里假设 q_proj 的输出经过 parent.num_heads 与 parent.head_dim 切分正确
+        query_states = output.view(B, L, parent.num_heads, parent.head_dim).transpose(1, 2)
+        parent.cached_query_states = query_states.clone()
+
+    def store_k_proj_hook(module, inputs, output):
+        """
+        对 k_proj 输出注册 Hook，用于保存 key_states：
+        输出 shape: [B, L, hidden_dim]
+        转换为： [B, num_heads, L, head_dim]
+        """
+        parent = module.__self__
+        B, L, _ = output.size()
+        key_states = output.view(B, L, parent.num_key_value_heads, parent.head_dim).transpose(1, 2)
+        parent.cached_key_states = key_states.clone()
+
+    def attn_logits_hook(module, inputs, output):
+        """
+        Hook 函数：在 self_attn 的 forward 结束后计算 attn_logits，并将其既追加到输出 tuple 中，
+        同时缓存到模块属性 cached_attn_logits 供后续 decoder 层使用。
+        
+        假定：
+        - module.cached_query_states 和 module.cached_key_states 分别为 [B, num_heads, L, head_dim] 的张量；
+        - module.is_causal 指示是否因果注意力。
+        """
+        # 检查中间变量是否存在
+        if not (hasattr(module, "cached_query_states") and hasattr(module, "cached_key_states")):
+            return output
+
+        query_states = module.cached_query_states  # [B, num_heads, L, head_dim]
+        key_states = module.cached_key_states      # [B, num_heads, L, head_dim]
+
+        scale_factor = 1 / math.sqrt(query_states.shape[-1])
+        # 计算原始 attn_logits，形状 [B, num_heads, L, L]
+        attn_logits = torch.matmul(query_states, key_states.transpose(-1, -2)) * scale_factor
+
+        # 如果是因果注意力则添加 mask
+        if getattr(module, "is_causal", False):
+            L, S = query_states.shape[-2], key_states.shape[-2]
+            temp_mask = torch.ones((L, S), dtype=torch.bool, device=query_states.device).tril(diagonal=0)
+            attn_bias = torch.zeros((L, S), dtype=query_states.dtype, device=query_states.device)
+            attn_bias.masked_fill_(~temp_mask, float("-inf"))
+            attn_logits = attn_logits + attn_bias
+
+        # Softmax 得到 attention 分布
+        attn_logits = torch.softmax(attn_logits, dim=-1)
+
+        # 将 attn_logits 缓存到 self_attn 模块上，后续 decoder 层使用
+        module.cached_attn_logits = attn_logits
+
+        # 将 attn_logits 追加到 self_attn 的输出中
+        # 这里应该可以不用追加了
+        if isinstance(output, tuple):
+            # 假定原输出为 (attn_output, attn_weights, present_key_value)
+            if len(output) == 3:
+                output = output + (attn_logits,)
+            else:
+                output = output[:3] + (attn_logits,)
+        else:
+            output = (output, attn_logits)
+        return output
+
+def decoder_attn_logits_hook(module, inputs, output):
+    """
+    Decoder 层的 hook：
+    在 decoder forward 返回后，直接使用 layer_outputs[2] 作为 attn_logits，
+    然后执行如下后处理：
+      1. 调用 attn_postprocess_topk 得到 pred_score_vis, s_flag, relation_vis_text
+      2. 构造策略 tensor policy，并对 pre_prompt 部分、question 部分进行调整
+      3. 根据策略中稀疏 token 的索引，执行 merge 和 cluster 操作
+      4. 更新 layer_outputs 的隐藏状态部分，并更新 position_ids、v_token_num、text_token_start 等信息
+    最后，将处理后的结果（以及 attn_logits）作为额外项追加到 decoder 的输出 tuple 中。
+    """
+    # 假定 decoder forward 返回的输出即 layer_outputs，为 tuple，其中：
+    #   layer_outputs[0]: 当前层的 hidden_states (B, L, C)
+    #   layer_outputs[1]: 可能的其他信息（如 attn_weights 等）
+    #   layer_outputs[2]: attn_logits（直接从 self_attn 的 hook 得到）
+    layer_outputs = output
+
+    # 直接用 layer_outputs[2] 作为 attn_logits
+    attn_logits = layer_outputs[2]
+
+    # 获取当前层所需的变量（前向中需提前保存到 module 属性上）
+    v_token_start        = getattr(module, "v_token_start", 0)
+    v_token_num          = getattr(module, "v_token_num", 0)
+    text_token_start     = getattr(module, "text_token_start", 0)
+    t_token_idx          = getattr(module, "t_token_idx", None)
+    layer_idx            = getattr(module, "layer_idx", 0)
+    retained_tokens      = getattr(module, "retained_tokens", 192)
+    pre_prompt_length_list = getattr(module, "pre_prompt_length_list", [])
+    image_shape          = getattr(module, "image_shape", 576)
+    hidden_states        = getattr(module, "current_hidden_states", None)  # shape: (B, L, C)
+    B                    = getattr(module, "B", None)
+    position_ids         = getattr(module, "position_ids", None)
+
+    # 若缺少必要信息，则直接返回附加 attn_logits
+    if attn_logits is None or hidden_states is None or B is None or position_ids is None:
+        if isinstance(layer_outputs, tuple):
+            return layer_outputs + (attn_logits,)
+        else:
+            return (layer_outputs, attn_logits)
+
+    # 1. 使用 attn_logits（即 layer_outputs[2]）调用后处理函数，得到可视化分数、标志和关系信息
+    pred_score_vis, s_flag, relation_vis_text = attn_postprocess_topk(
+        attn_logits,
+        v_token_start,
+        v_token_num,
+        text_token_start,
+        t_token_idx,
+        layer_idx,
+        retained_tokens
+    )  # 预测分数 pred_score_vis shape: (B, L_v)
+
+    # 2. 构造策略 policy，初始全1；并在 [v_token_start, text_token_start) 区间内赋值为 pred_score_vis
+    policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
+    policy[:, v_token_start:text_token_start] = pred_score_vis.type(dtype=hidden_states.dtype)
+
+    # 3. 针对每个 batch，根据 pre_prompt_length_list 保留 pre prompt 和 question 部分
+    for batch in range(len(pre_prompt_length_list)):
+        prompt_length = pre_prompt_length_list[batch]
+        # 保留 pre prompt 部分
+        policy[batch, :prompt_length] = 1
+        # 保留 question 部分：假定 question 从 prompt_length 开始，到 prompt_length + image_shape 结束
+        text_token_start = prompt_length + image_shape
+        policy[batch, text_token_start:] = 1
+
+    # 4. 找出策略中值为 0 的 token 索引（即稀疏 token）
+    total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  # shape: (1, num_sparse)
+
+    # 5. 根据是否存在稀疏 token进行 merge&cluster 处理
+    if s_flag and total_sparse_token_idx.shape[1] > 0:
+        # 重新获取稀疏 token索引（可重复，以确保正确性）
+        total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)
+        # 从当前层的隐藏状态中选取对应的 token（batch_index_select 为你提供的工具函数）
+        total_sparse_token = batch_index_select(layer_outputs[0], total_sparse_token_idx)
+
+        # 第一阶段：找出预测得分为0的 token 索引
+        merge_token_idx_stage1 = torch.where(pred_score_vis == 0)[1]
+        merge_token_stage1 = relation_vis_text[0][merge_token_idx_stage1]
+        merge_token_num_stage1 = int(merge_token_idx_stage1.shape[0] * 0.3) + 1  # Top 30%
+        merge_token_stage2_idx = merge_token_stage1.topk(merge_token_num_stage1)[1]
+
+        # 第二阶段：从所有稀疏 token 中选择对应的 token，并进行 merge
+        merge_token_stage2 = total_sparse_token[:, merge_token_stage2_idx, :]
+        cluster_num = int(merge_token_stage2.shape[1] / 10) + 1
+        if cluster_num == 0:
+            cluster_num = merge_token_stage2.shape[1]
+
+        merge_sparse_token = cluster_and_merge(merge_token_stage2, cluster_num)
+
+        # 选出策略中值为1的 token
+        select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # shape: (1, num_selected)
+        select_token = batch_index_select(layer_outputs[0], select_token_idx)
+        select_vis_token_num = pred_score_vis.sum()
+
+        # 将选中的 token、merge 得到的 token拼接起来
+        select_and_merge_token = torch.cat(
+            (
+                select_token[:, :v_token_start + select_vis_token_num, :],
+                merge_sparse_token,
+                select_token[:, v_token_start + select_vis_token_num:, :]
+            ),
+            dim=1
+        )
+        layer_outputs = (select_and_merge_token, layer_outputs[1])
+        # 更新 position_ids（假定其维度可按选取后的 token 数更新）
+        position_ids = position_ids[:, :len(select_token_idx[0]) + cluster_num]
+        prev_decision = policy
+        # 更新 v_token_num，假定其为预测得分之和加上 cluster 数
+        v_token_num = pred_score_vis.sum() + cluster_num
+        text_token_start = v_token_start + v_token_num
+    else:
+        # 如果稀疏 token 不存在或 s_flag 为 False，则直接选取策略中值为1的 token
+        select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)
+        layer_outputs = (batch_index_select(layer_outputs[0], select_token_idx), layer_outputs[1])
+        position_ids = position_ids[:, :len(select_token_idx[0])]
+        prev_decision = policy
+        v_token_num = pred_score_vis.sum()
+        text_token_start = v_token_start + v_token_num
+
+    # 最后，将原始 attn_logits（或其它你需要的信息）作为额外输出项追加到最终输出 tuple 中
+    new_output = layer_outputs + (attn_logits,)
+
+    return new_output
+
+
 
 layer_dict = {2: 0, 6: 1, 15: 2}     #
 
@@ -643,3 +851,30 @@ class LlamaDynamicvitFlashAttention2(LlamaFlashAttention2):
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights, past_key_value, attn_logits
+
+def  batch_index_select(x, idx):
+
+    if len(x.size()) == 4:
+        B, H, N, C = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N, H, C)[idx.reshape(-1)].reshape(B, H, N_new, C)
+        return out
+    elif len(x.size()) == 3:
+        # in this condition
+        B, N, C = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N, C)[idx.reshape(-1)].reshape(B, N_new, C)
+        return out
+    elif len(x.size()) == 2:
+        B, N = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N)[idx.reshape(-1)].reshape(B, N_new)
+        return out
+    else:
+        raise NotImplementedError
