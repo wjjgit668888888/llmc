@@ -5,14 +5,14 @@ export CUDA_VISIBLE_DEVICES=7
 llmc=/mnt/disk1/lct/llmc
 export PYTHONPATH=$llmc:$PYTHONPATH
 
-task_name=fastv_llava—log
-config=${llmc}/configs/sparsification/methods/FastV/fastv.yml
+# task_name=fastv_llava—log
+# config=${llmc}/configs/sparsification/methods/FastV/fastv.yml
 
 # task_name=tome_llava
 # config=${llmc}/configs/sparsification/methods/ToMe/tome.yml
 
-# task_name=sparsevlm_llava
-# config=${llmc}/configs/sparsification/methods/SparseVLM/sparsevlm.yml
+task_name=sparsevlm_llava
+config=${llmc}/configs/sparsification/methods/SparseVLM/sparsevlm.yml
 
 nnodes=1
 nproc_per_node=1
