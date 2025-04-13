@@ -149,7 +149,7 @@ class SparseVLM(TokenReductionModule):
             logger.info(f"[SparseVLM] attn_logits 形状：{attn_logits.shape}")
             return output
 
-        def decoder_attn_logits_hook(module, args, kwargs, pruning_pars, layer_idx):
+        def decoder_attn_logits_hook(module, args, kwargs):
             """
             1. 调用 attn_postprocess_topk 得到 pred_score_vis, s_flag, relation_vis_text
             2. 构造策略 tensor policy，并对 pre_prompt 部分、question 部分进行调整
@@ -158,6 +158,8 @@ class SparseVLM(TokenReductionModule):
             最后，将处理后的结果（以及 attn_logits）作为额外项追加到 decoder 的输出 tuple 中。
             """
             logger.info(f"[decoder_attn_logits_hook] kwargs type: {type(kwargs)}, keys: {getattr(kwargs, 'keys', 'Not a dict')}")
+            pruning_pars = kwargs['pruning_pars']
+            layer_idx = kwargs['layer_idx']
             attn_logits = pruning_pars['attn_logits']
             v_token_start = pruning_pars['v_token_start']
             t_token_idx = pruning_pars['t_token_idx']
@@ -269,7 +271,6 @@ class SparseVLM(TokenReductionModule):
             register_attention_hooks(self.blocks[loc])
             self.blocks[loc].register_forward_hook(
                 functools.partial(decoder_attn_logits_hook, 
-                                  pruning_pars=self.model.model.parameters,
                                   layer_idx=loc
                                   ),
                                   with_kwargs=True
