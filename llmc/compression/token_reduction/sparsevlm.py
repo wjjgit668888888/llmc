@@ -30,14 +30,40 @@ class SparseVLM(TokenReductionModule):
         special_config['init_token_total_shape'] = 668
         special_config['generate_process_count'] = 0
         special_config['pre_prompt_length_list'] = []
+        special_config['token_length_list'] = []
+
         special_config['image_shape'] = self.model.pruning_config['image_token_length']
         
+        logger.info(f"[SparseVLM] special_config 设置完成，包含 retained_tokens={special_config['retained_tokens']},init_token_total_shape={special_config['init_token_total_shape']}, image_shape={special_config['image_shape']}")
 
         self.model.model.parameters = special_config
     
 
     def register_reduction_modules(self):
         logger.info("[SparseVLM] Registering forward hooks...")
+        def input_hook(module, input_args, pruning_pars):
+            IMAGE_TOKEN_INDEX = 32000  # 请根据你自己的模型配置修改此值
+
+            input_ids = input_args[0]  # (B, L)
+            pre_prompt_length_list = []
+            token_length_list = []
+
+            for seq in input_ids:
+                # 找到首个 image token 的位置
+                image_token_index = (seq == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[0]
+                if len(image_token_index) > 0:
+                    pre_prompt_length_list.append(image_token_index[0].item())
+                else:
+                    pre_prompt_length_list.append(0)
+                token_length_list.append(seq.shape[0])
+
+            # 赋值给 module（比如 model.embed_tokens）
+            pruning_pars['pre_prompt_length_list'] = pre_prompt_length_list
+            pruning_pars['token_length_list'] = token_length_list
+            logger.info(f"[SparseVLM] 输入参数更新：pre_prompt_length_list={pre_prompt_length_list}, token_length_list={token_length_list}")
+
+            return None  # 不修改输入
+        
         def register_module_pars(module, args, kwargs, pruning_pars):
             pre_prompt_length_list = pruning_pars['pre_prompt_length_list']
 
@@ -45,17 +71,10 @@ class SparseVLM(TokenReductionModule):
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(kwargs['input_ids'])
             hidden_states = inputs_embeds  # shape: (B, L, C)
-
-            if (len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1):
-                v_t = hidden_states[:, v_token_start: text_token_start, :]
-                t_t = hidden_states[:, text_token_start: , :]
-                m_v_t = v_t @ t_t.transpose(1, 2) # [1, 576, 53]
-                m_v_t = m_v_t.softmax(2).mean(1) # [1, 53]
-                pruning_pars['t_token_idx'] = torch.where(m_v_t > m_v_t.mean())
  
             pruning_pars['B'], L, _ = hidden_states.shape
             B = pruning_pars['B']
-            init_n = pruning_pars['init_token_total_shape'] + pruning_pars['self.generate_process_count']    # 668
+            init_n = pruning_pars['init_token_total_shape'] + pruning_pars['generate_process_count']    # 668
             pruning_pars['prev_decision'] = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
             pruning_pars['policy'] = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
 
@@ -64,10 +83,20 @@ class SparseVLM(TokenReductionModule):
             pruning_pars['text_token_start'] = pruning_pars['v_token_start'] + pruning_pars['image_shape'] # 35 + 576 = 611
             text_token_start = pruning_pars['text_token_start']
             pruning_pars['v_token_num'] = pruning_pars['image_shape'] # 576
-    
+
+            
+            if (len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1):
+                v_t = hidden_states[:, v_token_start: text_token_start, :]
+                t_t = hidden_states[:, text_token_start: , :]
+                m_v_t = v_t @ t_t.transpose(1, 2) # [1, 576, 53]
+                m_v_t = m_v_t.softmax(2).mean(1) # [1, 53]
+                pruning_pars['t_token_idx'] = torch.where(m_v_t > m_v_t.mean())
+
+            logger.info(f"[SparseVLM] pruning参数更新：B={B}, v_token_start={v_token_start}, text_token_start={text_token_start}, v_token_num={pruning_pars['v_token_num']}")
             return args, kwargs
         
         def register_attention_hooks(block):
+            logger.info("[SparseVLM] Registering attention hooks for block")
             parent = block.self_attn
             block.self_attn.q_proj.register_forward_hook(  
                 functools.partial(store_q_proj_hook,
@@ -115,18 +144,9 @@ class SparseVLM(TokenReductionModule):
             attn_logits = torch.softmax(attn_logits, dim=-1)
 
             # 将 attn_logits 缓存到 self_attn 模块上，后续 decoder 层使用
-            pruning_pars['cached_attn_logits'] = attn_logits
+            pruning_pars['attn_logits'] = attn_logits
 
-            # 将 attn_logits 追加到 self_attn 的输出中
-            # 这里应该可以不用追加了
-            if isinstance(output, tuple):
-                # 假定原输出为 (attn_output, attn_weights, present_key_value)
-                if len(output) == 3:
-                    output = output + (attn_logits,)
-                else:
-                    output = output[:3] + (attn_logits,)
-            else:
-                output = (output, attn_logits)
+            logger.info(f"[SparseVLM] attn_logits 形状：{attn_logits.shape}")
             return output
 
         def decoder_attn_logits_hook(module, args, kwargs, pruning_pars, layer_idx):
@@ -227,9 +247,12 @@ class SparseVLM(TokenReductionModule):
 
             new_output = layer_outputs + (attn_logits,)
             # hidden_states = layer_outputs[0]
+            logger.info(f"[SparseVLM] 输出 token 总数：{layer_outputs[0].shape[1]}")
             return new_output
         
-        
+        self.model.embed_tokens.register_forward_pre_hook(functools.partial(
+                input_hook,
+                pruning_pars=self.model.model.parameters))
         self.model.model.register_forward_pre_hook(
             functools.partial(
                 register_module_pars,
@@ -245,7 +268,6 @@ class SparseVLM(TokenReductionModule):
                                   pruning_pars=self.model.model.parameters,
                                   layer_idx=loc
                                   ),
-                with_kwargs=True
             )
             start_idx = loc + 1
             if i < len(sorted_pruning_locs) - 1:
