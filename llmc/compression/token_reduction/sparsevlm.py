@@ -157,6 +157,7 @@ class SparseVLM(TokenReductionModule):
             4. 更新 layer_outputs 的隐藏状态部分，并更新 position_ids、v_token_num、text_token_start 等信息
             最后，将处理后的结果（以及 attn_logits）作为额外项追加到 decoder 的输出 tuple 中。
             """
+            logger.info(f"[decoder_attn_logits_hook] kwargs type: {type(kwargs)}, keys: {getattr(kwargs, 'keys', 'Not a dict')}")
             attn_logits = pruning_pars['attn_logits']
             v_token_start = pruning_pars['v_token_start']
             t_token_idx = pruning_pars['t_token_idx']
@@ -177,6 +178,8 @@ class SparseVLM(TokenReductionModule):
                 layer_idx,
                 retained_tokens
             )  # 预测分数 pred_score_vis shape: (B, L_v)
+            logger.info(f"[decoder_attn_logits_hook] s_flag: {s_flag}, pred_score_vis.shape: {pred_score_vis.shape}")
+
 
             # 2. 构造策略 policy，初始全1；并在 [v_token_start, text_token_start) 区间内赋值为 pred_score_vis
             policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
@@ -193,6 +196,7 @@ class SparseVLM(TokenReductionModule):
 
             # 4. 找出策略中值为 0 的 token 索引（即稀疏 token）
             total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  # shape: (1, num_sparse)
+            logger.info(f"[decoder_attn_logits_hook] total_sparse_token_idx.shape: {total_sparse_token_idx.shape}")
 
             # 5. 根据是否存在稀疏 token进行 merge&cluster 处理
             if s_flag and total_sparse_token_idx.shape[1] > 0:
@@ -268,6 +272,7 @@ class SparseVLM(TokenReductionModule):
                                   pruning_pars=self.model.model.parameters,
                                   layer_idx=loc
                                   ),
+                                  with_kwargs=True
             )
             start_idx = loc + 1
             if i < len(sorted_pruning_locs) - 1:
