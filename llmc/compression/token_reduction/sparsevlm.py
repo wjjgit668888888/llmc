@@ -284,6 +284,8 @@ class SparseVLM(TokenReductionModule):
             cache_position = position_ids.detach().clone()
 
             # 注入到 pruning_pars 中供下使用
+            pruning_pars['v_token_num'] = v_token_num
+            pruning_pars['text_token_start'] = text_token_start
             pruning_pars['position_ids'] = position_ids
             pruning_pars['cache_position'] = cache_position
             pruning_pars['position_embeddings'] = None
