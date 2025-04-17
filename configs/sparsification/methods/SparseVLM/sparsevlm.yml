@@ -16,7 +16,9 @@ sparse:
     method: TokenReduction
     special:
         method: SparseVLM
-        pruning_loc: [2, 6, 15]
+        # pruning_loc: [2, 6, 15]
+        pruning_loc: [2]
+
 save:
     save_trans: False
     save_fake: False

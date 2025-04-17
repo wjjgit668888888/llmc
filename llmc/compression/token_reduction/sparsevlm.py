@@ -6,6 +6,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import einops as ein
 from llmc.utils.registry_factory import TOKEN_REDUCTION_REGISTRY
 
 from .token_reduction_module import TokenReductionModule
@@ -42,7 +43,8 @@ class SparseVLM(TokenReductionModule):
     def register_reduction_modules(self):
         logger.info("[SparseVLM] Registering forward hooks...")
         def input_hook(module, input_args, pruning_pars):
-            IMAGE_TOKEN_INDEX = 32000  # 请根据你自己的模型配置修改此值
+            # todo:不要写死了
+            IMAGE_TOKEN_INDEX = 32000  
 
             input_ids = input_args[0]  # (B, L)
             pre_prompt_length_list = []
@@ -91,6 +93,7 @@ class SparseVLM(TokenReductionModule):
                 m_v_t = v_t @ t_t.transpose(1, 2) # [1, 576, 53]
                 m_v_t = m_v_t.softmax(2).mean(1) # [1, 53]
                 pruning_pars['t_token_idx'] = torch.where(m_v_t > m_v_t.mean())
+
 
             logger.info(f"[SparseVLM] pruning参数更新：B={B}, v_token_start={v_token_start}, text_token_start={text_token_start}, v_token_num={pruning_pars['v_token_num']}")
             return args, kwargs
@@ -143,13 +146,20 @@ class SparseVLM(TokenReductionModule):
             # Softmax 得到 attention 分布
             attn_logits = torch.softmax(attn_logits, dim=-1)
 
-            # 将 attn_logits 缓存到 self_attn 模块上，后续 decoder 层使用
+            # 将 attn_logits 缓存到 pruning_pars 上，后续 decoder 层使用
             pruning_pars['attn_logits'] = attn_logits
 
             logger.info(f"[SparseVLM] attn_logits 形状：{attn_logits.shape}")
             return output
+        
+        def update_output_attentions_hook(module, args, kwargs, pruning_pars):
+            logger.info(
+                f"update_output_attentions_hook triggered on {module.__class__.__name__}")
+            kwargs['output_attentions'] = True
+            pruning_pars['position_ids'] = kwargs['position_ids']
+            return args, kwargs
 
-        def decoder_attn_logits_hook(module, args, kwargs):
+        def decoder_attn_logits_hook(module, inputs, output, *, pruning_pars, layer_idx):
             """
             1. 调用 attn_postprocess_topk 得到 pred_score_vis, s_flag, relation_vis_text
             2. 构造策略 tensor policy，并对 pre_prompt 部分、question 部分进行调整
@@ -157,16 +167,34 @@ class SparseVLM(TokenReductionModule):
             4. 更新 layer_outputs 的隐藏状态部分，并更新 position_ids、v_token_num、text_token_start 等信息
             最后，将处理后的结果（以及 attn_logits）作为额外项追加到 decoder 的输出 tuple 中。
             """
-            logger.info(f"[decoder_attn_logits_hook] kwargs type: {type(kwargs)}, keys: {getattr(kwargs, 'keys', 'Not a dict')}")
-            pruning_pars = kwargs['pruning_pars']
-            layer_idx = kwargs['layer_idx']
+            logger.info(f"[decoder_attn_logits_hook] Hook for layer {layer_idx} called")
+            logger.info(f"inputs type: {type(inputs)}, len: {len(inputs)}")
+
+            for idx, inp in enumerate(inputs):
+                logger.info(f"inputs[{idx}] type: {type(inp)}, shape: {getattr(inp, 'shape', 'N/A')}")
+
+            logger.info(f"[decoder_attn_logits_hook] output type: {type(output)}")
+            logger.info(f"[decoder_attn_logits_hook] pruning_pars type: {type(pruning_pars)}")
+            logger.info(f"[decoder_attn_logits_hook] pruning_pars keys: {list(pruning_pars.keys())}")
+
+            # 提取必要参数
             attn_logits = pruning_pars['attn_logits']
             v_token_start = pruning_pars['v_token_start']
+            text_token_start = pruning_pars['text_token_start']
             t_token_idx = pruning_pars['t_token_idx']
+            v_token_num = pruning_pars['v_token_num']
             retained_tokens = pruning_pars['retained_tokens']
             B = pruning_pars['B']
-            # 是decoder中的一个入参hidden_states
-            hidden_states = kwargs['hidden_states']
+            pre_prompt_length_list = pruning_pars['pre_prompt_length_list']
+            image_shape = pruning_pars['image_shape']
+            layer_outputs = output
+            position_ids = pruning_pars['position_ids']
+            logger.info(f"[decoder_attn_logits_hook] original layer_outputs type: {type(layer_outputs)}, len: {len(layer_outputs)}")
+
+            logger.info(f"attn_logits shape: {getattr(attn_logits, 'shape', 'N/A')}")
+
+            # 从 inputs 中获取 hidden_states
+            hidden_states = inputs[0] # [B, L, D]
             pre_prompt_length_list = pruning_pars['pre_prompt_length_list']
             image_shape = pruning_pars['image_shape']
 
@@ -250,11 +278,44 @@ class SparseVLM(TokenReductionModule):
                 prev_decision = policy
                 v_token_num = pred_score_vis.sum()
                 text_token_start = v_token_start + v_token_num
-
-            new_output = layer_outputs + (attn_logits,)
+            # 这里应该不用加
+            new_output = layer_outputs
             # hidden_states = layer_outputs[0]
+            cache_position = position_ids.detach().clone()
+
+            # 注入到 pruning_pars 中供下使用
+            pruning_pars['position_ids'] = position_ids
+            pruning_pars['cache_position'] = cache_position
+            pruning_pars['position_embeddings'] = None
             logger.info(f"[SparseVLM] 输出 token 总数：{layer_outputs[0].shape[1]}")
             return new_output
+        
+        def read_parameter_hook(module, args, kwargs, pruning_pars):
+            logger.info(f"[read_parameter_hook] injecting pruning parameters into layer {module.__class__.__name__}")
+
+            for key, value in kwargs.items():
+                if isinstance(value, torch.Tensor):
+                    logger.info(f"  kwargs['{key}']: shape = {value.shape}, dtype = {value.dtype}, device = {value.device}")
+                else:
+                    logger.info(f"  kwargs['{key}']: type = {type(value)}, value = {value}")
+
+            # 打印你注入的 position_ids 的 shape
+            pos_ids = pruning_pars.get("position_ids", None)
+            if pos_ids is not None:
+                logger.info(f"[read_parameter_hook] Injected position_ids.shape = {pos_ids.shape}")
+            else:
+                logger.warning("[read_parameter_hook] pruning_pars does not contain 'position_ids'")
+            
+            kwargs['position_ids'] = pruning_pars['position_ids']
+            kwargs['cache_position'] = pruning_pars['cache_position']
+            kwargs['position_embeddings'] = pruning_pars['position_embeddings']
+            for key, value in kwargs.items():
+                if isinstance(value, torch.Tensor):
+                    logger.info(f"  kwargs['{key}']: shape = {value.shape}, dtype = {value.dtype}, device = {value.device}")
+                else:
+                    logger.info(f"  kwargs['{key}']: type = {type(value)}, value = {value}")
+
+            return args, kwargs
         
         self.model.embed_tokens.register_forward_pre_hook(functools.partial(
                 input_hook,
@@ -267,23 +328,38 @@ class SparseVLM(TokenReductionModule):
         )
         sorted_pruning_locs = sorted(self.pruning_loc)
         total_layers = len(self.blocks)
+        self.blocks[sorted_pruning_locs[0]].register_forward_pre_hook(
+                functools.partial(update_output_attentions_hook, 
+                                  pruning_pars=self.model.model.parameters,
+                                  ),
+                with_kwargs=True
+            )
         for i, loc in enumerate(sorted_pruning_locs):
             register_attention_hooks(self.blocks[loc])
             self.blocks[loc].register_forward_hook(
                 functools.partial(decoder_attn_logits_hook, 
+                                  pruning_pars=self.model.model.parameters,
                                   layer_idx=loc
                                   ),
-                                  with_kwargs=True
             )
             start_idx = loc + 1
-            if i < len(sorted_pruning_locs) - 1:
-                end_idx = sorted_pruning_locs[i + 1]
-            else:
-                end_idx = total_layers
+            # if i < len(sorted_pruning_locs) - 1:
+            #     end_idx = sorted_pruning_locs[i + 1]
+            # else:
+            #     end_idx = total_layers
             # for j in range(start_idx, end_idx):
-            #     layer = self.blocks[j]
-            #     layer.register_forward_pre_hook(self._inject_params_hook)
-
+            #     self.blocks[j].register_forward_pre_hook(
+            #         functools.partial(read_parameter_hook,
+            #                         pruning_pars=self.model.model.parameters),
+            #         with_kwargs=True
+            #     )
+        first_start_idx = sorted_pruning_locs[0] + 1
+        for j in range(first_start_idx, total_layers):
+            self.blocks[j].register_forward_pre_hook(
+                functools.partial(read_parameter_hook,
+                                pruning_pars=self.model.model.parameters),
+                with_kwargs=True
+            )
 
 layer_dict = {2: 0, 6: 1, 15: 2}     #
 

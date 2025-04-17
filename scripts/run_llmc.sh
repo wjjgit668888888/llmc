@@ -11,7 +11,7 @@ export PYTHONPATH=$llmc:$PYTHONPATH
 # task_name=tome_llava
 # config=${llmc}/configs/sparsification/methods/ToMe/tome.yml
 
-task_name=sparsevlm_llava
+task_name=sparsevlm_llava_V1
 config=${llmc}/configs/sparsification/methods/SparseVLM/sparsevlm.yml
 
 nnodes=1
