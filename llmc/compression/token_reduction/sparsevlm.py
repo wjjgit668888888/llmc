@@ -11,15 +11,11 @@ from llmc.utils.registry_factory import TOKEN_REDUCTION_REGISTRY
 
 from .token_reduction_module import TokenReductionModule
 
-from loguru import logger
-
 
 @TOKEN_REDUCTION_REGISTRY.register('SparseVLM')
 class SparseVLM(TokenReductionModule):
     def __init__(self, config, model, blocks):
         super().__init__(config, model, blocks)
-        logger.info(
-            '[SparseVLM] Initializing SparseVLM token reduction module...')
         self.add_sparse_config()
         self.register_reduction_modules()
 
@@ -27,7 +23,6 @@ class SparseVLM(TokenReductionModule):
         special_config = self.config.get('special', {})
 
         self.pruning_loc = special_config.get('pruning_loc', [2, 6, 15])
-        logger.info(f"[SparseVLM] pruning_loc set to {self.pruning_loc}")
         # retained_tokens或许可以外部传入
         special_config['retained_tokens'] = 192
         special_config['init_token_total_shape'] = 668
@@ -37,13 +32,10 @@ class SparseVLM(TokenReductionModule):
 
         special_config['image_shape'] = self.model.pruning_config['image_token_length']
 
-        logger.info(
-            f"[SparseVLM] special_config 设置完成，包含 retained_tokens={special_config['retained_tokens']},init_token_total_shape={special_config['init_token_total_shape']}, image_shape={special_config['image_shape']}")
-
+    
         self.model.model.parameters = special_config
 
     def register_reduction_modules(self):
-        logger.info("[SparseVLM] Registering forward hooks...")
 
         def input_hook(module, input_args, pruning_pars):
             # todo:不要写死了
@@ -66,9 +58,7 @@ class SparseVLM(TokenReductionModule):
             # 赋值给 module（比如 model.embed_tokens）
             pruning_pars['pre_prompt_length_list'] = pre_prompt_length_list
             pruning_pars['token_length_list'] = token_length_list
-            logger.info(
-                f"[SparseVLM] 输入参数更新：pre_prompt_length_list={pre_prompt_length_list}, token_length_list={token_length_list}")
-
+        
             return None  # 不修改输入
 
         def register_module_pars(module, args, kwargs, pruning_pars):
@@ -102,13 +92,10 @@ class SparseVLM(TokenReductionModule):
                 m_v_t = v_t @ t_t.transpose(1, 2)  # [1, 576, 53]
                 m_v_t = m_v_t.softmax(2).mean(1)  # [1, 53]
                 pruning_pars['t_token_idx'] = torch.where(m_v_t > m_v_t.mean())
-
-            logger.info(
-                f"[SparseVLM] pruning参数更新：B={B}, v_token_start={v_token_start}, text_token_start={text_token_start}, v_token_num={pruning_pars['v_token_num']}")
+            
             return args, kwargs
 
         def register_attention_hooks(block):
-            logger.info("[SparseVLM] Registering attention hooks for block")
             parent = block.self_attn
             block.self_attn.q_proj.register_forward_hook(
                 functools.partial(store_q_proj_hook,
@@ -165,7 +152,6 @@ class SparseVLM(TokenReductionModule):
             # 将 attn_logits 缓存到 pruning_pars 上，后续 decoder 层使用
             pruning_pars['attn_logits'] = attn_logits
 
-            logger.info(f"[SparseVLM] attn_logits 形状：{attn_logits.shape}")
             return output
 
         def init_position_ids_hook(module, args, kwargs, pruning_pars):
@@ -173,8 +159,6 @@ class SparseVLM(TokenReductionModule):
             return args, kwargs
 
         def update_output_attentions_hook(module, args, kwargs, pruning_pars):
-            logger.info(
-                f"update_output_attentions_hook triggered on {module.__class__.__name__}")
             kwargs['output_attentions'] = True
             return args, kwargs
 
@@ -186,21 +170,6 @@ class SparseVLM(TokenReductionModule):
             4. 更新 layer_outputs 的隐藏状态部分，并更新 position_ids、v_token_num、text_token_start 等信息
             最后，将处理后的结果（以及 attn_logits）作为额外项追加到 decoder 的输出 tuple 中。
             """
-            logger.info(
-                f"[decoder_attn_logits_hook] Hook for layer {layer_idx} called")
-            logger.info(f"inputs type: {type(inputs)}, len: {len(inputs)}")
-
-            for idx, inp in enumerate(inputs):
-                logger.info(
-                    f"inputs[{idx}] type: {type(inp)}, shape: {getattr(inp, 'shape', 'N/A')}")
-
-            logger.info(
-                f"[decoder_attn_logits_hook] output type: {type(output)}")
-            logger.info(
-                f"[decoder_attn_logits_hook] pruning_pars type: {type(pruning_pars)}")
-            logger.info(
-                f"[decoder_attn_logits_hook] pruning_pars keys: {list(pruning_pars.keys())}")
-
             # 提取必要参数
             attn_logits = pruning_pars['attn_logits']
             v_token_start = pruning_pars['v_token_start']
@@ -213,11 +182,6 @@ class SparseVLM(TokenReductionModule):
             image_shape = pruning_pars['image_shape']
             layer_outputs = output
             position_ids = pruning_pars['position_ids']
-            logger.info(
-                f"[decoder_attn_logits_hook] original layer_outputs type: {type(layer_outputs)}, len: {len(layer_outputs)}")
-
-            logger.info(
-                f"attn_logits shape: {getattr(attn_logits, 'shape', 'N/A')}")
 
             # 从 inputs 中获取 hidden_states
             hidden_states = inputs[0]  # [B, L, D]
@@ -234,8 +198,6 @@ class SparseVLM(TokenReductionModule):
                 layer_idx,
                 retained_tokens
             )  # 预测分数 pred_score_vis shape: (B, L_v)
-            logger.info(
-                f"[decoder_attn_logits_hook] s_flag: {s_flag}, pred_score_vis.shape: {pred_score_vis.shape}")
 
             # 2. 构造策略 policy，初始全1；并在 [v_token_start, text_token_start) 区间内赋值为 pred_score_vis
             policy = torch.ones(
@@ -255,8 +217,6 @@ class SparseVLM(TokenReductionModule):
             # 4. 找出策略中值为 0 的 token 索引（即稀疏 token）
             total_sparse_token_idx = torch.where(
                 policy == 0)[1].unsqueeze(0)  # shape: (1, num_sparse)
-            logger.info(
-                f"[decoder_attn_logits_hook] total_sparse_token_idx.shape: {total_sparse_token_idx.shape}")
 
             # 5. 根据是否存在稀疏 token进行 merge&cluster 处理
             if s_flag and total_sparse_token_idx.shape[1] > 0:
@@ -331,41 +291,14 @@ class SparseVLM(TokenReductionModule):
             pruning_pars['position_ids'] = position_ids
             pruning_pars['cache_position'] = cache_position
             pruning_pars['position_embeddings'] = None
-            logger.info(f"[SparseVLM] 输出 token 总数：{layer_outputs[0].shape[1]}")
+
             return new_output
 
         def read_parameter_hook(module, args, kwargs, pruning_pars):
-            logger.info(
-                f"[read_parameter_hook] injecting pruning parameters into layer {module.__class__.__name__}")
-
-            for key, value in kwargs.items():
-                if isinstance(value, torch.Tensor):
-                    logger.info(
-                        f"  kwargs['{key}']: shape = {value.shape}, dtype = {value.dtype}, device = {value.device}")
-                else:
-                    logger.info(
-                        f"  kwargs['{key}']: type = {type(value)}, value = {value}")
-
-            # 打印你注入的 position_ids 的 shape
-            pos_ids = pruning_pars.get("position_ids", None)
-            if pos_ids is not None:
-                logger.info(
-                    f"[read_parameter_hook] Injected position_ids.shape = {pos_ids.shape}")
-            else:
-                logger.warning(
-                    "[read_parameter_hook] pruning_pars does not contain 'position_ids'")
-
             kwargs['position_ids'] = pruning_pars['position_ids']
             kwargs['cache_position'] = pruning_pars['cache_position']
             kwargs['position_embeddings'] = pruning_pars['position_embeddings']
-            for key, value in kwargs.items():
-                if isinstance(value, torch.Tensor):
-                    logger.info(
-                        f"  kwargs['{key}']: shape = {value.shape}, dtype = {value.dtype}, device = {value.device}")
-                else:
-                    logger.info(
-                        f"  kwargs['{key}']: type = {type(value)}, value = {value}")
-
+            
             return args, kwargs
 
         self.model.embed_tokens.register_forward_pre_hook(functools.partial(
