@@ -13,11 +13,13 @@ from .token_reduction_module import TokenReductionModule
 
 from loguru import logger
 
+
 @TOKEN_REDUCTION_REGISTRY.register('SparseVLM')
 class SparseVLM(TokenReductionModule):
     def __init__(self, config, model, blocks):
         super().__init__(config, model, blocks)
-        logger.info('[SparseVLM] Initializing SparseVLM token reduction module...')
+        logger.info(
+            '[SparseVLM] Initializing SparseVLM token reduction module...')
         self.add_sparse_config()
         self.register_reduction_modules()
 
@@ -34,17 +36,18 @@ class SparseVLM(TokenReductionModule):
         special_config['token_length_list'] = []
 
         special_config['image_shape'] = self.model.pruning_config['image_token_length']
-        
-        logger.info(f"[SparseVLM] special_config 设置完成，包含 retained_tokens={special_config['retained_tokens']},init_token_total_shape={special_config['init_token_total_shape']}, image_shape={special_config['image_shape']}")
+
+        logger.info(
+            f"[SparseVLM] special_config 设置完成，包含 retained_tokens={special_config['retained_tokens']},init_token_total_shape={special_config['init_token_total_shape']}, image_shape={special_config['image_shape']}")
 
         self.model.model.parameters = special_config
-    
 
     def register_reduction_modules(self):
         logger.info("[SparseVLM] Registering forward hooks...")
+
         def input_hook(module, input_args, pruning_pars):
             # todo:不要写死了
-            IMAGE_TOKEN_INDEX = 32000  
+            IMAGE_TOKEN_INDEX = 32000
 
             input_ids = input_args[0]  # (B, L)
             pre_prompt_length_list = []
@@ -52,7 +55,8 @@ class SparseVLM(TokenReductionModule):
 
             for seq in input_ids:
                 # 找到首个 image token 的位置
-                image_token_index = (seq == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[0]
+                image_token_index = (
+                    seq == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[0]
                 if len(image_token_index) > 0:
                     pre_prompt_length_list.append(image_token_index[0].item())
                 else:
@@ -62,10 +66,11 @@ class SparseVLM(TokenReductionModule):
             # 赋值给 module（比如 model.embed_tokens）
             pruning_pars['pre_prompt_length_list'] = pre_prompt_length_list
             pruning_pars['token_length_list'] = token_length_list
-            logger.info(f"[SparseVLM] 输入参数更新：pre_prompt_length_list={pre_prompt_length_list}, token_length_list={token_length_list}")
+            logger.info(
+                f"[SparseVLM] 输入参数更新：pre_prompt_length_list={pre_prompt_length_list}, token_length_list={token_length_list}")
 
             return None  # 不修改输入
-        
+
         def register_module_pars(module, args, kwargs, pruning_pars):
             pre_prompt_length_list = pruning_pars['pre_prompt_length_list']
 
@@ -73,73 +78,84 @@ class SparseVLM(TokenReductionModule):
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(kwargs['input_ids'])
             hidden_states = inputs_embeds  # shape: (B, L, C)
- 
+
             pruning_pars['B'], L, _ = hidden_states.shape
             B = pruning_pars['B']
-            init_n = pruning_pars['init_token_total_shape'] + pruning_pars['generate_process_count']    # 668
-            pruning_pars['prev_decision'] = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
-            pruning_pars['policy'] = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
+            init_n = pruning_pars['init_token_total_shape'] + \
+                pruning_pars['generate_process_count']    # 668
+            pruning_pars['prev_decision'] = torch.ones(
+                B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
+            pruning_pars['policy'] = torch.ones(
+                B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
 
-            pruning_pars['v_token_start'] = pre_prompt_length_list[0] if len(pre_prompt_length_list) != 0 else 0 # 35
+            pruning_pars['v_token_start'] = pre_prompt_length_list[0] if len(
+                pre_prompt_length_list) != 0 else 0  # 35
             v_token_start = pruning_pars['v_token_start']
-            pruning_pars['text_token_start'] = pruning_pars['v_token_start'] + pruning_pars['image_shape'] # 35 + 576 = 611
+            pruning_pars['text_token_start'] = pruning_pars['v_token_start'] + \
+                pruning_pars['image_shape']  # 35 + 576 = 611
             text_token_start = pruning_pars['text_token_start']
-            pruning_pars['v_token_num'] = pruning_pars['image_shape'] # 576
+            pruning_pars['v_token_num'] = pruning_pars['image_shape']  # 576
 
-            
-            if (len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1):
+            if (len(pre_prompt_length_list) != 0 and hidden_states.shape[1] != 1):
                 v_t = hidden_states[:, v_token_start: text_token_start, :]
-                t_t = hidden_states[:, text_token_start: , :]
-                m_v_t = v_t @ t_t.transpose(1, 2) # [1, 576, 53]
-                m_v_t = m_v_t.softmax(2).mean(1) # [1, 53]
+                t_t = hidden_states[:, text_token_start:, :]
+                m_v_t = v_t @ t_t.transpose(1, 2)  # [1, 576, 53]
+                m_v_t = m_v_t.softmax(2).mean(1)  # [1, 53]
                 pruning_pars['t_token_idx'] = torch.where(m_v_t > m_v_t.mean())
 
-
-            logger.info(f"[SparseVLM] pruning参数更新：B={B}, v_token_start={v_token_start}, text_token_start={text_token_start}, v_token_num={pruning_pars['v_token_num']}")
+            logger.info(
+                f"[SparseVLM] pruning参数更新：B={B}, v_token_start={v_token_start}, text_token_start={text_token_start}, v_token_num={pruning_pars['v_token_num']}")
             return args, kwargs
-        
+
         def register_attention_hooks(block):
             logger.info("[SparseVLM] Registering attention hooks for block")
             parent = block.self_attn
-            block.self_attn.q_proj.register_forward_hook(  
+            block.self_attn.q_proj.register_forward_hook(
                 functools.partial(store_q_proj_hook,
-                                parent = parent,
-                                pruning_pars=self.model.model.parameters),
+                                  parent=parent,
+                                  pruning_pars=self.model.model.parameters),
             )
-            block.self_attn.k_proj.register_forward_hook(  
+            block.self_attn.k_proj.register_forward_hook(
                 functools.partial(store_k_proj_hook,
-                                parent = parent,
-                                pruning_pars=self.model.model.parameters),
+                                  parent=parent,
+                                  pruning_pars=self.model.model.parameters),
             )
-            block.self_attn.register_forward_hook(  
+            block.self_attn.register_forward_hook(
                 functools.partial(attn_logits_hook,
-                                pruning_pars=self.model.model.parameters),
+                                  pruning_pars=self.model.model.parameters),
             )
-        
+
         def store_q_proj_hook(module, inputs, output, parent, pruning_pars):
             B, L, _ = output.size()
-            query_states = output.view(B, L, parent.num_heads, parent.head_dim).transpose(1, 2)  # → [B, H, L, Dh]
+            query_states = output.view(B, L, parent.num_heads, parent.head_dim).transpose(
+                1, 2)  # → [B, H, L, Dh]
             pruning_pars['cached_query_states'] = query_states.detach()
-            
+
         def store_k_proj_hook(module, inputs, output, parent, pruning_pars):
             B, L, _ = output.size()
-            key_states = output.view(B, L, parent.num_heads, parent.head_dim).transpose(1, 2)  # → [B, H, L, Dh]
+            key_states = output.view(B, L, parent.num_heads, parent.head_dim).transpose(
+                1, 2)  # → [B, H, L, Dh]
             pruning_pars['cached_key_states'] = key_states.detach()
 
         def attn_logits_hook(module, inputs, output, pruning_pars):
 
-            query_states = pruning_pars['cached_query_states']  # [B, num_heads, L, head_dim]
-            key_states = pruning_pars['cached_key_states']      # [B, num_heads, L, head_dim]
+            # [B, num_heads, L, head_dim]
+            query_states = pruning_pars['cached_query_states']
+            # [B, num_heads, L, head_dim]
+            key_states = pruning_pars['cached_key_states']
 
             scale_factor = 1 / math.sqrt(query_states.shape[-1])
             # 计算原始 attn_logits，形状 [B, num_heads, L, L]
-            attn_logits = torch.matmul(query_states, key_states.transpose(-1, -2)) * scale_factor
+            attn_logits = torch.matmul(
+                query_states, key_states.transpose(-1, -2)) * scale_factor
 
             # 如果是因果注意力则添加 mask
             if getattr(module, "is_causal", False):
                 L, S = query_states.shape[-2], key_states.shape[-2]
-                temp_mask = torch.ones((L, S), dtype=torch.bool, device=query_states.device).tril(diagonal=0)
-                attn_bias = torch.zeros((L, S), dtype=query_states.dtype, device=query_states.device)
+                temp_mask = torch.ones(
+                    (L, S), dtype=torch.bool, device=query_states.device).tril(diagonal=0)
+                attn_bias = torch.zeros(
+                    (L, S), dtype=query_states.dtype, device=query_states.device)
                 attn_bias.masked_fill_(~temp_mask, float("-inf"))
                 attn_logits = attn_logits + attn_bias
 
@@ -151,12 +167,15 @@ class SparseVLM(TokenReductionModule):
 
             logger.info(f"[SparseVLM] attn_logits 形状：{attn_logits.shape}")
             return output
-        
+
+        def init_position_ids_hook(module, args, kwargs, pruning_pars):
+            pruning_pars['position_ids'] = kwargs['position_ids']
+            return args, kwargs
+
         def update_output_attentions_hook(module, args, kwargs, pruning_pars):
             logger.info(
                 f"update_output_attentions_hook triggered on {module.__class__.__name__}")
             kwargs['output_attentions'] = True
-            pruning_pars['position_ids'] = kwargs['position_ids']
             return args, kwargs
 
         def decoder_attn_logits_hook(module, inputs, output, *, pruning_pars, layer_idx):
@@ -167,15 +186,20 @@ class SparseVLM(TokenReductionModule):
             4. 更新 layer_outputs 的隐藏状态部分，并更新 position_ids、v_token_num、text_token_start 等信息
             最后，将处理后的结果（以及 attn_logits）作为额外项追加到 decoder 的输出 tuple 中。
             """
-            logger.info(f"[decoder_attn_logits_hook] Hook for layer {layer_idx} called")
+            logger.info(
+                f"[decoder_attn_logits_hook] Hook for layer {layer_idx} called")
             logger.info(f"inputs type: {type(inputs)}, len: {len(inputs)}")
 
             for idx, inp in enumerate(inputs):
-                logger.info(f"inputs[{idx}] type: {type(inp)}, shape: {getattr(inp, 'shape', 'N/A')}")
+                logger.info(
+                    f"inputs[{idx}] type: {type(inp)}, shape: {getattr(inp, 'shape', 'N/A')}")
 
-            logger.info(f"[decoder_attn_logits_hook] output type: {type(output)}")
-            logger.info(f"[decoder_attn_logits_hook] pruning_pars type: {type(pruning_pars)}")
-            logger.info(f"[decoder_attn_logits_hook] pruning_pars keys: {list(pruning_pars.keys())}")
+            logger.info(
+                f"[decoder_attn_logits_hook] output type: {type(output)}")
+            logger.info(
+                f"[decoder_attn_logits_hook] pruning_pars type: {type(pruning_pars)}")
+            logger.info(
+                f"[decoder_attn_logits_hook] pruning_pars keys: {list(pruning_pars.keys())}")
 
             # 提取必要参数
             attn_logits = pruning_pars['attn_logits']
@@ -189,12 +213,14 @@ class SparseVLM(TokenReductionModule):
             image_shape = pruning_pars['image_shape']
             layer_outputs = output
             position_ids = pruning_pars['position_ids']
-            logger.info(f"[decoder_attn_logits_hook] original layer_outputs type: {type(layer_outputs)}, len: {len(layer_outputs)}")
+            logger.info(
+                f"[decoder_attn_logits_hook] original layer_outputs type: {type(layer_outputs)}, len: {len(layer_outputs)}")
 
-            logger.info(f"attn_logits shape: {getattr(attn_logits, 'shape', 'N/A')}")
+            logger.info(
+                f"attn_logits shape: {getattr(attn_logits, 'shape', 'N/A')}")
 
             # 从 inputs 中获取 hidden_states
-            hidden_states = inputs[0] # [B, L, D]
+            hidden_states = inputs[0]  # [B, L, D]
             pre_prompt_length_list = pruning_pars['pre_prompt_length_list']
             image_shape = pruning_pars['image_shape']
 
@@ -208,12 +234,14 @@ class SparseVLM(TokenReductionModule):
                 layer_idx,
                 retained_tokens
             )  # 预测分数 pred_score_vis shape: (B, L_v)
-            logger.info(f"[decoder_attn_logits_hook] s_flag: {s_flag}, pred_score_vis.shape: {pred_score_vis.shape}")
-
+            logger.info(
+                f"[decoder_attn_logits_hook] s_flag: {s_flag}, pred_score_vis.shape: {pred_score_vis.shape}")
 
             # 2. 构造策略 policy，初始全1；并在 [v_token_start, text_token_start) 区间内赋值为 pred_score_vis
-            policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
-            policy[:, v_token_start:text_token_start] = pred_score_vis.type(dtype=hidden_states.dtype)
+            policy = torch.ones(
+                B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
+            policy[:, v_token_start:text_token_start] = pred_score_vis.type(
+                dtype=hidden_states.dtype)
 
             # 3. 针对每个 batch，根据 pre_prompt_length_list 保留 pre prompt 和 question 部分
             for batch in range(len(pre_prompt_length_list)):
@@ -225,47 +253,60 @@ class SparseVLM(TokenReductionModule):
                 policy[batch, text_token_start:] = 1
 
             # 4. 找出策略中值为 0 的 token 索引（即稀疏 token）
-            total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  # shape: (1, num_sparse)
-            logger.info(f"[decoder_attn_logits_hook] total_sparse_token_idx.shape: {total_sparse_token_idx.shape}")
+            total_sparse_token_idx = torch.where(
+                policy == 0)[1].unsqueeze(0)  # shape: (1, num_sparse)
+            logger.info(
+                f"[decoder_attn_logits_hook] total_sparse_token_idx.shape: {total_sparse_token_idx.shape}")
 
             # 5. 根据是否存在稀疏 token进行 merge&cluster 处理
             if s_flag and total_sparse_token_idx.shape[1] > 0:
                 # 重新获取稀疏 token索引（可重复，以确保正确性）
-                total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)
+                total_sparse_token_idx = torch.where(policy == 0)[
+                    1].unsqueeze(0)
                 # 从当前层的隐藏状态中选取对应的 token（batch_index_select 为你提供的工具函数）
-                total_sparse_token = batch_index_select(layer_outputs[0], total_sparse_token_idx)
+                total_sparse_token = batch_index_select(
+                    layer_outputs[0], total_sparse_token_idx)
 
                 # 第一阶段：找出预测得分为0的 token 索引
                 merge_token_idx_stage1 = torch.where(pred_score_vis == 0)[1]
                 merge_token_stage1 = relation_vis_text[0][merge_token_idx_stage1]
-                merge_token_num_stage1 = int(merge_token_idx_stage1.shape[0] * 0.3) + 1  # Top 30%
-                merge_token_stage2_idx = merge_token_stage1.topk(merge_token_num_stage1)[1]
+                merge_token_num_stage1 = int(
+                    merge_token_idx_stage1.shape[0] * 0.3) + 1  # Top 30%
+                merge_token_stage2_idx = merge_token_stage1.topk(
+                    merge_token_num_stage1)[1]
 
                 # 第二阶段：从所有稀疏 token 中选择对应的 token，并进行 merge
-                merge_token_stage2 = total_sparse_token[:, merge_token_stage2_idx, :]
+                merge_token_stage2 = total_sparse_token[:,
+                                                        merge_token_stage2_idx, :]
                 cluster_num = int(merge_token_stage2.shape[1] / 10) + 1
                 if cluster_num == 0:
                     cluster_num = merge_token_stage2.shape[1]
 
-                merge_sparse_token = cluster_and_merge(merge_token_stage2, cluster_num)
+                merge_sparse_token = cluster_and_merge(
+                    merge_token_stage2, cluster_num)
 
                 # 选出策略中值为1的 token
-                select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # shape: (1, num_selected)
-                select_token = batch_index_select(layer_outputs[0], select_token_idx)
+                select_token_idx = torch.where(policy == 1)[1].unsqueeze(
+                    0)  # shape: (1, num_selected)
+                select_token = batch_index_select(
+                    layer_outputs[0], select_token_idx)
                 select_vis_token_num = pred_score_vis.sum()
 
                 # 将选中的 token、merge 得到的 token拼接起来
                 select_and_merge_token = torch.cat(
                     (
-                        select_token[:, :v_token_start + select_vis_token_num, :],
+                        select_token[:, :v_token_start +
+                                     select_vis_token_num, :],
                         merge_sparse_token,
-                        select_token[:, v_token_start + select_vis_token_num:, :]
+                        select_token[:, v_token_start +
+                                     select_vis_token_num:, :]
                     ),
                     dim=1
                 )
                 layer_outputs = (select_and_merge_token, layer_outputs[1])
                 # 更新 position_ids（假定其维度可按选取后的 token 数更新）
-                position_ids = position_ids[:, :len(select_token_idx[0]) + cluster_num]
+                position_ids = position_ids[:, :len(
+                    select_token_idx[0]) + cluster_num]
                 prev_decision = policy
                 # 更新 v_token_num，假定其为预测得分之和加上 cluster 数
                 v_token_num = pred_score_vis.sum() + cluster_num
@@ -273,7 +314,8 @@ class SparseVLM(TokenReductionModule):
             else:
                 # 如果稀疏 token 不存在或 s_flag 为 False，则直接选取策略中值为1的 token
                 select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)
-                layer_outputs = (batch_index_select(layer_outputs[0], select_token_idx), layer_outputs[1])
+                layer_outputs = (batch_index_select(
+                    layer_outputs[0], select_token_idx), layer_outputs[1])
                 position_ids = position_ids[:, :len(select_token_idx[0])]
                 prev_decision = policy
                 v_token_num = pred_score_vis.sum()
@@ -291,37 +333,44 @@ class SparseVLM(TokenReductionModule):
             pruning_pars['position_embeddings'] = None
             logger.info(f"[SparseVLM] 输出 token 总数：{layer_outputs[0].shape[1]}")
             return new_output
-        
+
         def read_parameter_hook(module, args, kwargs, pruning_pars):
-            logger.info(f"[read_parameter_hook] injecting pruning parameters into layer {module.__class__.__name__}")
+            logger.info(
+                f"[read_parameter_hook] injecting pruning parameters into layer {module.__class__.__name__}")
 
             for key, value in kwargs.items():
                 if isinstance(value, torch.Tensor):
-                    logger.info(f"  kwargs['{key}']: shape = {value.shape}, dtype = {value.dtype}, device = {value.device}")
+                    logger.info(
+                        f"  kwargs['{key}']: shape = {value.shape}, dtype = {value.dtype}, device = {value.device}")
                 else:
-                    logger.info(f"  kwargs['{key}']: type = {type(value)}, value = {value}")
+                    logger.info(
+                        f"  kwargs['{key}']: type = {type(value)}, value = {value}")
 
             # 打印你注入的 position_ids 的 shape
             pos_ids = pruning_pars.get("position_ids", None)
             if pos_ids is not None:
-                logger.info(f"[read_parameter_hook] Injected position_ids.shape = {pos_ids.shape}")
+                logger.info(
+                    f"[read_parameter_hook] Injected position_ids.shape = {pos_ids.shape}")
             else:
-                logger.warning("[read_parameter_hook] pruning_pars does not contain 'position_ids'")
-            
+                logger.warning(
+                    "[read_parameter_hook] pruning_pars does not contain 'position_ids'")
+
             kwargs['position_ids'] = pruning_pars['position_ids']
             kwargs['cache_position'] = pruning_pars['cache_position']
             kwargs['position_embeddings'] = pruning_pars['position_embeddings']
             for key, value in kwargs.items():
                 if isinstance(value, torch.Tensor):
-                    logger.info(f"  kwargs['{key}']: shape = {value.shape}, dtype = {value.dtype}, device = {value.device}")
+                    logger.info(
+                        f"  kwargs['{key}']: shape = {value.shape}, dtype = {value.dtype}, device = {value.device}")
                 else:
-                    logger.info(f"  kwargs['{key}']: type = {type(value)}, value = {value}")
+                    logger.info(
+                        f"  kwargs['{key}']: type = {type(value)}, value = {value}")
 
             return args, kwargs
-        
+
         self.model.embed_tokens.register_forward_pre_hook(functools.partial(
-                input_hook,
-                pruning_pars=self.model.model.parameters))
+            input_hook,
+            pruning_pars=self.model.model.parameters))
         self.model.model.register_forward_pre_hook(
             functools.partial(
                 register_module_pars,
@@ -331,15 +380,21 @@ class SparseVLM(TokenReductionModule):
         sorted_pruning_locs = sorted(self.pruning_loc)
         total_layers = len(self.blocks)
         self.blocks[sorted_pruning_locs[0]].register_forward_pre_hook(
-                functools.partial(update_output_attentions_hook, 
+            functools.partial(init_position_ids_hook,
+                              pruning_pars=self.model.model.parameters,
+                              ),
+            with_kwargs=True
+        )
+        for i, loc in enumerate(sorted_pruning_locs):
+            register_attention_hooks(self.blocks[loc])
+            self.blocks[loc].register_forward_pre_hook(
+                functools.partial(update_output_attentions_hook,
                                   pruning_pars=self.model.model.parameters,
                                   ),
                 with_kwargs=True
             )
-        for i, loc in enumerate(sorted_pruning_locs):
-            register_attention_hooks(self.blocks[loc])
             self.blocks[loc].register_forward_hook(
-                functools.partial(decoder_attn_logits_hook, 
+                functools.partial(decoder_attn_logits_hook,
                                   pruning_pars=self.model.model.parameters,
                                   layer_idx=loc
                                   ),
@@ -359,9 +414,10 @@ class SparseVLM(TokenReductionModule):
         for j in range(first_start_idx, total_layers):
             self.blocks[j].register_forward_pre_hook(
                 functools.partial(read_parameter_hook,
-                                pruning_pars=self.model.model.parameters),
+                                  pruning_pars=self.model.model.parameters),
                 with_kwargs=True
             )
+
 
 layer_dict = {2: 0, 6: 1, 15: 2}     #
 
@@ -403,11 +459,13 @@ def attn_postprocess_topk(self_attn_weights, v_token_start, v_token_num, text_to
         s_flag = False
     return mask, s_flag, relation_vis_text
 
-def  batch_index_select(x, idx):
+
+def batch_index_select(x, idx):
     if len(x.size()) == 4:
         B, H, N, C = x.size()
         N_new = idx.size(1)
-        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        offset = torch.arange(B, dtype=torch.long,
+                              device=x.device).view(B, 1) * N
         idx = idx + offset
         out = x.reshape(B*N, H, C)[idx.reshape(-1)].reshape(B, H, N_new, C)
         return out
@@ -415,19 +473,22 @@ def  batch_index_select(x, idx):
         # in this condition
         B, N, C = x.size()
         N_new = idx.size(1)
-        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        offset = torch.arange(B, dtype=torch.long,
+                              device=x.device).view(B, 1) * N
         idx = idx + offset
         out = x.reshape(B*N, C)[idx.reshape(-1)].reshape(B, N_new, C)
         return out
     elif len(x.size()) == 2:
         B, N = x.size()
         N_new = idx.size(1)
-        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        offset = torch.arange(B, dtype=torch.long,
+                              device=x.device).view(B, 1) * N
         idx = idx + offset
         out = x.reshape(B*N)[idx.reshape(-1)].reshape(B, N_new)
         return out
     else:
         raise NotImplementedError
+
 
 def index_points(points, idx):
     """Sample features following the index.
@@ -444,21 +505,23 @@ def index_points(points, idx):
     view_shape[1:] = [1] * (len(view_shape) - 1)
     repeat_shape = list(idx.shape)
     repeat_shape[0] = 1
-    batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
+    batch_indices = torch.arange(B, dtype=torch.long).to(
+        device).view(view_shape).repeat(repeat_shape)
     new_points = points[batch_indices, idx, :]
     return new_points
 
 
 def cluster_and_merge(x, cluster_num):
-    
+
     B, N, C = x.shape
 
     x1 = ein.rearrange(x, "b l r -> b l () r")
     x2 = ein.rearrange(x, "b l r -> b () l r")
     distance = (x1 - x2).norm(dim=-1, p=2)
-    dist_matrix = distance / (C ** 0.5)        
+    dist_matrix = distance / (C ** 0.5)
     # get local density
-    dist_nearest, index_nearest = torch.topk(dist_matrix, k=cluster_num, dim=-1, largest=False)
+    dist_nearest, index_nearest = torch.topk(
+        dist_matrix, k=cluster_num, dim=-1, largest=False)
     density = (-(dist_nearest ** 2).mean(dim=-1)).exp()
     # add a little noise to ensure no tokens have the same density.
     density = density + torch.rand(
@@ -468,21 +531,25 @@ def cluster_and_merge(x, cluster_num):
     mask = density[:, None, :] > density[:, :, None]
     mask = mask.type(x.dtype)
     dist_max = dist_matrix.flatten(1).max(dim=-1)[0][:, None, None]
-    dist, index_parent = (dist_matrix * mask + dist_max * (1 - mask)).min(dim=-1)
+    dist, index_parent = (dist_matrix * mask +
+                          dist_max * (1 - mask)).min(dim=-1)
 
     # select clustering center according to score
     score = dist * density
-    _, index_down = torch.topk(score, k=cluster_num, dim=-1)        
+    _, index_down = torch.topk(score, k=cluster_num, dim=-1)
 
     # assign tokens to the nearest center
-    dist_matrix = index_points(dist_matrix, index_down)     
+    dist_matrix = index_points(dist_matrix, index_down)
 
-    idx_cluster = dist_matrix.argmin(dim=1)    
+    idx_cluster = dist_matrix.argmin(dim=1)
 
-    # make sure cluster center merge to itself 
-    idx_batch = torch.arange(B, device=x.device)[:, None].expand(B, cluster_num)
-    idx_tmp = torch.arange(cluster_num, device=x.device)[None, :].expand(B, cluster_num)
-    idx_cluster[idx_batch.reshape(-1), index_down.reshape(-1)] = idx_tmp.reshape(-1)
+    # make sure cluster center merge to itself
+    idx_batch = torch.arange(B, device=x.device)[
+        :, None].expand(B, cluster_num)
+    idx_tmp = torch.arange(cluster_num, device=x.device)[
+        None, :].expand(B, cluster_num)
+    idx_cluster[idx_batch.reshape(-1),
+                index_down.reshape(-1)] = idx_tmp.reshape(-1)
 
     # merge tokens
 
@@ -490,27 +557,27 @@ def cluster_and_merge(x, cluster_num):
     device = dist_matrix.device
     idx_token = torch.arange(N)[None, :].repeat(B, 1).to(device)
     agg_weight = x.new_ones(B, N, 1)
-    
+
     token_weight = x.new_ones(B, N, 1)
     # self_attn_weights = self_attn_weights.mean(1)
-    # token_weight = self_attn_weights.sum(dim=1).exp().unsqueeze(2) 
+    # token_weight = self_attn_weights.sum(dim=1).exp().unsqueeze(2)
     # B_weight,N_weigh,C_weight = token_weight.shape
     # token_weight = token_weight.reshape(B_weight*N_weigh, C_weight)[sparse_token_idx.reshape(-1)].reshape(B, N, 1)
-    
+
     idx_batch = torch.arange(B, device=x.device)[:, None]
-    idx = idx_cluster + idx_batch * cluster_num     
+    idx = idx_cluster + idx_batch * cluster_num
 
     all_weight = token_weight.new_zeros(B * cluster_num, 1)
-    all_weight.index_add_(dim=0, index=idx.reshape(B * N),      
-                            source=token_weight.reshape(B * N, 1))      
+    all_weight.index_add_(dim=0, index=idx.reshape(B * N),
+                          source=token_weight.reshape(B * N, 1))
     all_weight = all_weight + 1e-6
-    norm_weight = token_weight / all_weight[idx]       
+    norm_weight = token_weight / all_weight[idx]
 
     # average token features
     x_merged = x.new_zeros(B * cluster_num, C)
     source = x * norm_weight
-    x_merged.index_add_(dim=0, index=idx.reshape(B * N),        
+    x_merged.index_add_(dim=0, index=idx.reshape(B * N),
                         source=source.reshape(B * N, C).type(x.dtype))
     x_merged = x_merged.reshape(B, cluster_num, C)
-    
+
     return x_merged
